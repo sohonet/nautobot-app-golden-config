@@ -4,6 +4,7 @@
 import difflib
 import logging
 import os
+import requests
 from collections import defaultdict
 from datetime import datetime
 
@@ -170,12 +171,14 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
     backup_cfg = _open_file_config(backup_file)
     intended_cfg = _open_file_config(intended_file)
 
+    # Capture compliance data for webhook
+    compliance_records = []
     for rule in rules[obj.platform.network_driver]:
         _actual = get_config_element(rule, backup_cfg, obj, logger)
         _intended = get_config_element(rule, intended_cfg, obj, logger)
 
         # using update_or_create() method to conveniently update actual obj or create new one.
-        ConfigCompliance.objects.update_or_create(
+        comp, created = ConfigCompliance.objects.update_or_create(
             device=obj,
             rule=rule["obj"],
             defaults={
@@ -186,12 +189,22 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
             },
         )
 
+        # Capture for webhook payload
+        compliance_records.append({
+            'id': str(comp.id),
+            'feature_name': rule["obj"].feature.name if rule["obj"].feature else None,
+            'actual_config': _actual,
+            'intended_config': _intended,
+            'is_compliant': comp.compliance,
+            'rule_id': str(rule["obj"].id),
+        })
+
     compliance_obj.compliance_last_success_date = task.host.defaults.data["now"]
     compliance_obj.compliance_config = "\n".join(diff_files(backup_file, intended_file))
     compliance_obj.save()
     logger.info("Successfully tested compliance job.", extra={"object": obj})
 
-    return Result(host=task.host)
+    return Result(host=task.host, result=compliance_records)
 
 
 def config_compliance(job):  # pylint: disable=unused-argument
@@ -248,3 +261,31 @@ def config_compliance(job):  # pylint: disable=unused-argument
     logger.debug("Completed compliance job for devices.")
     if results.failed:
         raise ComplianceFailure()
+
+    # Send webhook with compliance data to config-webapp in batches
+    try:
+        webhook_url = os.environ.get('CONFIG_WEBAPP_WEBHOOK_URL')
+        if webhook_url:
+            devices_data = []
+            for host, task_results in results.items():
+                device = host.data["obj"]
+                devices_data.append({
+                    'id': str(device.id),
+                    'name': device.name,
+                    'platform': device.platform.network_driver if device.platform else 'unknown',
+                    'compliance_records': task_results[0].result
+                })
+
+            # Send in batches of 50 devices to avoid large payloads
+            batch_size = 50
+            total_batches = (len(devices_data) + batch_size - 1) // batch_size
+
+            for i in range(0, len(devices_data), batch_size):
+                batch = devices_data[i:i+batch_size]
+                batch_num = (i // batch_size) + 1
+
+                response = requests.post(webhook_url, json={'devices': batch}, timeout=10)
+                logger.info(f"Sent webhook batch {batch_num}/{total_batches} ({len(batch)} devices): HTTP {response.status_code}")
+
+    except Exception as err:
+        logger.warning(f"Failed to send webhook to config-webapp: {err}")
