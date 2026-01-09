@@ -264,28 +264,32 @@ def config_compliance(job):  # pylint: disable=unused-argument
 
     # Send webhook with compliance data to config-webapp in batches
     try:
-        webhook_url = os.environ.get('CONFIG_WEBAPP_WEBHOOK_URL')
-        if webhook_url:
-            devices_data = []
-            for host, task_results in results.items():
-                device = host.data["obj"]
-                devices_data.append({
-                    'id': str(device.id),
-                    'name': device.name,
-                    'platform': device.platform.network_driver if device.platform else 'unknown',
-                    'compliance_records': task_results[0].result
-                })
+        webhook_url = os.environ.get(
+            'CONFIG_WEBAPP_WEBHOOK_URL',
+            'https://xn-xsvm-s-19-ldp02-gb/api/devices/webhook/compliance/'
+        )
+        logger.info(f"Sending compliance results to config-webapp webhook: {webhook_url}")
+        devices_data = []
+        for hostname, task_results in results.items():
+            # task_results[0].host is the actual Host object with data
+            device = task_results[0].host.data["obj"]
+            devices_data.append({
+                'id': str(device.id),
+                'name': device.name,
+                'platform': device.platform.network_driver if device.platform else 'unknown',
+                'compliance_records': task_results[0].result
+            })
 
-            # Send in batches of 50 devices to avoid large payloads
-            batch_size = 50
-            total_batches = (len(devices_data) + batch_size - 1) // batch_size
+        # Send in batches of 50 devices to avoid large payloads
+        batch_size = 50
+        total_batches = (len(devices_data) + batch_size - 1) // batch_size
 
-            for i in range(0, len(devices_data), batch_size):
-                batch = devices_data[i:i+batch_size]
-                batch_num = (i // batch_size) + 1
+        for i in range(0, len(devices_data), batch_size):
+            batch = devices_data[i:i+batch_size]
+            batch_num = (i // batch_size) + 1
 
-                response = requests.post(webhook_url, json={'devices': batch}, timeout=10)
-                logger.info(f"Sent webhook batch {batch_num}/{total_batches} ({len(batch)} devices): HTTP {response.status_code}")
+            response = requests.post(webhook_url, json={'devices': batch}, timeout=10, verify=False)
+            logger.info(f"Sent webhook batch {batch_num}/{total_batches} ({len(batch)} devices): HTTP {response.status_code}")
 
     except Exception as err:
         logger.warning(f"Failed to send webhook to config-webapp: {err}")
