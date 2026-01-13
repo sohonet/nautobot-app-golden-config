@@ -273,6 +273,9 @@ def config_compliance(job):  # pylint: disable=unused-argument
         for hostname, task_results in results.items():
             # task_results[0].host is the actual Host object with data
             device = task_results[0].host.data["obj"]
+            logger.debug(f"[{hostname}] task_results[0]: {task_results[0]}")
+            logger.debug(f"[{hostname}] task_results[0].result type: {type(task_results[0].result)}")
+            logger.debug(f"[{hostname}] task_results[0].result: {task_results[0].result}")
             devices_data.append({
                 'id': str(device.id),
                 'name': device.name,
