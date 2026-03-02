@@ -189,12 +189,12 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
             },
         )
 
-        # Capture for webhook payload
+        # Capture for webhook payload — use post-compliance values from DB
         compliance_records.append({
             'id': str(comp.id),
             'feature_name': rule["obj"].feature.name if rule["obj"].feature else None,
-            'actual_config': _actual,
-            'intended_config': _intended,
+            'actual_config': comp.actual,
+            'intended_config': comp.intended,
             'is_compliant': comp.compliance,
             'rule_id': str(rule["obj"].id),
         })
