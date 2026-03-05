@@ -190,18 +190,31 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
         )
 
         # Capture for webhook payload — use post-compliance values from DB
-        compliance_records.append({
-            'id': str(comp.id),
-            'feature_name': rule["obj"].feature.name if rule["obj"].feature else None,
-            'actual_config': comp.actual,
-            'intended_config': comp.intended,
-            'is_compliant': comp.compliance,
-            'rule_id': str(rule["obj"].id),
-        })
+        #compliance_records.append({
+        #    'id': str(comp.id),
+        #    'feature_name': rule["obj"].feature.name if rule["obj"].feature else None,
+        #    'actual_config': comp.actual,
+        #    'intended_config': comp.intended,
+        #    'is_compliant': comp.compliance,
+        #    'rule_id': str(rule["obj"].id),
+        #})
 
     compliance_obj.compliance_last_success_date = task.host.defaults.data["now"]
     compliance_obj.compliance_config = "\n".join(diff_files(backup_file, intended_file))
     compliance_obj.save()
+    
+    # Build webhook payload from DB (post-custom-compliance state)
+    compliance_records = []
+    for comp_record in ConfigCompliance.objects.filter(device=obj):
+        compliance_records.append({
+            'id': str(comp_record.id),
+            'feature_name': comp_record.rule.feature.name if comp_record.rule.feature else None,
+            'actual_config': comp_record.actual,
+            'intended_config': comp_record.intended,
+            'is_compliant': comp_record.compliance,
+            'rule_id': str(comp_record.rule.id),
+        })
+        
     logger.info("Successfully tested compliance job.", extra={"object": obj})
 
     return Result(host=task.host, result=compliance_records)
