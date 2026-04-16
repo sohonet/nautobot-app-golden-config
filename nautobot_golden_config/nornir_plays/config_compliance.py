@@ -286,13 +286,19 @@ def config_compliance(job):  # pylint: disable=unused-argument
         for hostname, task_results in results.items():
             # task_results[0].host is the actual Host object with data
             device = task_results[0].host.data["obj"]
-            logger.debug(f"[{hostname}] task_results[0]: {task_results[0]}")
-            logger.debug(f"[{hostname}] task_results[0].result type: {type(task_results[0].result)}")
-            logger.debug(f"[{hostname}] task_results[0].result: {task_results[0].result}")
+            if not device.platform:
+                logger.warning(f"Skipping device {device.name}: no platform assigned")
+                continue
             devices_data.append({
                 'id': str(device.id),
                 'name': device.name,
-                'platform': device.platform.network_driver if device.platform else 'unknown',
+                'platform': device.platform.network_driver,
+                'ip_address': str(device.primary_ip4.host) if device.primary_ip4 else None,
+                'location': device.location.name if device.location else None,
+                'device_type': device.device_type.model if device.device_type else None,
+                'role': device.role.name if device.role else None,
+                'status': device.status.name if device.status else None,
+                'serial': device.serial or '',
                 'compliance_records': task_results[0].result
             })
 
