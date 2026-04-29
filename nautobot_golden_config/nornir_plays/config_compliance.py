@@ -4,6 +4,7 @@
 import difflib
 import logging
 import os
+import requests
 from collections import defaultdict
 from datetime import datetime
 
@@ -189,9 +190,22 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
     compliance_obj.compliance_last_success_date = task.host.defaults.data["now"]
     compliance_obj.compliance_config = "\n".join(diff_files(backup_file, intended_file))
     compliance_obj.save()
+    
+    # Build webhook payload from DB (post-custom-compliance state)
+    compliance_records = []
+    for comp_record in ConfigCompliance.objects.filter(device=obj):
+        compliance_records.append({
+            'id': str(comp_record.id),
+            'feature_name': comp_record.rule.feature.name if comp_record.rule.feature else None,
+            'actual_config': comp_record.actual,
+            'intended_config': comp_record.intended,
+            'is_compliant': comp_record.compliance,
+            'rule_id': str(comp_record.rule.id),
+        })
+        
     logger.info("Successfully tested compliance job.", extra={"object": obj})
 
-    return Result(host=task.host)
+    return Result(host=task.host, result=compliance_records)
 
 
 def config_compliance(job):  # pylint: disable=unused-argument
@@ -248,3 +262,43 @@ def config_compliance(job):  # pylint: disable=unused-argument
     logger.debug("Completed compliance job for devices.")
     if results.failed:
         raise ComplianceFailure()
+
+    # Send webhook with compliance data to config-webapp in batches
+    try:
+        webhook_url = os.environ.get('CONFIG_WEBAPP_WEBHOOK_URL')
+        if not webhook_url:
+            raise ValueError("CONFIG_WEBAPP_WEBHOOK_URL environment variable is not set")
+        logger.info(f"Sending compliance results to config-webapp webhook: {webhook_url}")
+        devices_data = []
+        for hostname, task_results in results.items():
+            # task_results[0].host is the actual Host object with data
+            device = task_results[0].host.data["obj"]
+            if not device.platform:
+                logger.warning(f"Skipping device {device.name}: no platform assigned")
+                continue
+            devices_data.append({
+                'id': str(device.id),
+                'name': device.name,
+                'platform': device.platform.network_driver,
+                'ip_address': str(device.primary_ip4.host) if device.primary_ip4 else None,
+                'location': device.location.name if device.location else None,
+                'device_type': device.device_type.model if device.device_type else None,
+                'role': device.role.name if device.role else None,
+                'status': device.status.name if device.status else None,
+                'serial': device.serial or '',
+                'compliance_records': task_results[0].result
+            })
+
+        # Send in batches of 50 devices to avoid large payloads
+        batch_size = 50
+        total_batches = (len(devices_data) + batch_size - 1) // batch_size
+
+        for i in range(0, len(devices_data), batch_size):
+            batch = devices_data[i:i+batch_size]
+            batch_num = (i // batch_size) + 1
+
+            response = requests.post(webhook_url, json={'devices': batch}, timeout=10, verify=False)
+            logger.info(f"Sent webhook batch {batch_num}/{total_batches} ({len(batch)} devices): HTTP {response.status_code}")
+
+    except Exception as err:
+        logger.warning(f"Failed to send webhook to config-webapp: {err}")
