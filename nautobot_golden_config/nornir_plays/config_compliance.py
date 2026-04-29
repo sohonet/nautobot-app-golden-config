@@ -171,14 +171,12 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
     backup_cfg = _open_file_config(backup_file)
     intended_cfg = _open_file_config(intended_file)
 
-    # Capture compliance data for webhook
-    compliance_records = []
     for rule in rules[obj.platform.network_driver]:
         _actual = get_config_element(rule, backup_cfg, obj, logger)
         _intended = get_config_element(rule, intended_cfg, obj, logger)
 
         # using update_or_create() method to conveniently update actual obj or create new one.
-        comp, created = ConfigCompliance.objects.update_or_create(
+        ConfigCompliance.objects.update_or_create(
             device=obj,
             rule=rule["obj"],
             defaults={
@@ -188,16 +186,6 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
                 "extra": "",
             },
         )
-
-        # Capture for webhook payload — use post-compliance values from DB
-        #compliance_records.append({
-        #    'id': str(comp.id),
-        #    'feature_name': rule["obj"].feature.name if rule["obj"].feature else None,
-        #    'actual_config': comp.actual,
-        #    'intended_config': comp.intended,
-        #    'is_compliant': comp.compliance,
-        #    'rule_id': str(rule["obj"].id),
-        #})
 
     compliance_obj.compliance_last_success_date = task.host.defaults.data["now"]
     compliance_obj.compliance_config = "\n".join(diff_files(backup_file, intended_file))
@@ -277,10 +265,9 @@ def config_compliance(job):  # pylint: disable=unused-argument
 
     # Send webhook with compliance data to config-webapp in batches
     try:
-        webhook_url = os.environ.get(
-            'CONFIG_WEBAPP_WEBHOOK_URL',
-            'https://xn-xsvm-s-19-ldp02-gb/api/devices/webhook/compliance/'
-        )
+        webhook_url = os.environ.get('CONFIG_WEBAPP_WEBHOOK_URL')
+        if not webhook_url:
+            raise ValueError("CONFIG_WEBAPP_WEBHOOK_URL environment variable is not set")
         logger.info(f"Sending compliance results to config-webapp webhook: {webhook_url}")
         devices_data = []
         for hostname, task_results in results.items():
