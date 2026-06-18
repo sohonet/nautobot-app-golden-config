@@ -12,7 +12,8 @@ def close_threaded_db_connections(func):
     def inner(*args, **kwargs):
         """Inner function."""
         try:
-            func(*args, **kwargs)
+            # Return the result so decorated functions can pass data to callers
+            return func(*args, **kwargs)
 
         finally:
             # Only clear DB connections if plays are threaded
