@@ -191,7 +191,26 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
     compliance_obj.compliance_config = "\n".join(diff_files(backup_file, intended_file))
     compliance_obj.save()
     
-    # Build webhook payload from DB (post-custom-compliance state)
+    # Build webhook payload from DB (post-custom-compliance state).
+    # Attach apply_order: the position of each feature's section within the
+    # full rendered intended config. The template emits prerequisites before
+    # the sections that depend on them (e.g. VRFs before anycast-gateways),
+    # so this line order is the correct order in which to apply the features.
+    # Reuse the intended config already read into memory.
+    intended_lines = [line.strip() for line in intended_cfg.splitlines() if line.strip()]
+
+    def _apply_order(section):
+        """First-line position of an intended section in the full config;
+        sections that are empty or can't be located sort last."""
+        for line in section.splitlines():
+            stripped = line.strip()
+            if stripped:
+                try:
+                    return intended_lines.index(stripped)
+                except ValueError:
+                    break
+        return len(intended_lines)
+
     compliance_records = []
     for comp_record in ConfigCompliance.objects.filter(device=obj):
         compliance_records.append({
@@ -201,8 +220,12 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
             'intended_config': comp_record.intended,
             'is_compliant': comp_record.compliance,
             'rule_id': str(comp_record.rule.id),
+            'apply_order': _apply_order(comp_record.intended),
         })
-        
+
+    # Emit in dependency order so the consumer applies prerequisites first.
+    compliance_records.sort(key=lambda record: record['apply_order'])
+
     logger.info("Successfully tested compliance job.", extra={"object": obj})
 
     return Result(host=task.host, result=compliance_records)
