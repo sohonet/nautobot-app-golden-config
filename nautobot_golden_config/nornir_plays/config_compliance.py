@@ -4,10 +4,10 @@
 import difflib
 import logging
 import os
-import requests
 from collections import defaultdict
 from datetime import datetime
 
+import requests
 from django.utils.timezone import make_aware
 from lxml import etree
 from nautobot_plugin_nornir.constants import NORNIR_SETTINGS
@@ -190,7 +190,7 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
     compliance_obj.compliance_last_success_date = task.host.defaults.data["now"]
     compliance_obj.compliance_config = "\n".join(diff_files(backup_file, intended_file))
     compliance_obj.save()
-    
+
     # Build webhook payload from DB (post-custom-compliance state).
     # Attach apply_order: the position of each feature's section within the
     # full rendered intended config. The template emits prerequisites before
@@ -231,7 +231,7 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
     return Result(host=task.host, result=compliance_records)
 
 
-def config_compliance(job):  # pylint: disable=unused-argument
+def config_compliance(job):  # pylint: disable=unused-argument,too-many-locals
     """
     Nornir play to generate configurations.
 
@@ -293,7 +293,7 @@ def config_compliance(job):  # pylint: disable=unused-argument
             raise ValueError("CONFIG_WEBAPP_WEBHOOK_URL environment variable is not set")
         logger.info(f"Sending compliance results to config-webapp webhook: {webhook_url}")
         devices_data = []
-        for hostname, task_results in results.items():
+        for task_results in results.values():
             # task_results[0].host is the actual Host object with data
             device = task_results[0].host.data["obj"]
             if not device.platform:
@@ -316,12 +316,12 @@ def config_compliance(job):  # pylint: disable=unused-argument
         batch_size = 50
         total_batches = (len(devices_data) + batch_size - 1) // batch_size
 
-        for i in range(0, len(devices_data), batch_size):
-            batch = devices_data[i:i+batch_size]
-            batch_num = (i // batch_size) + 1
+        for batch_start in range(0, len(devices_data), batch_size):
+            batch = devices_data[batch_start:batch_start+batch_size]
+            batch_num = (batch_start // batch_size) + 1
 
             response = requests.post(webhook_url, json={'devices': batch}, timeout=10, verify=False)
             logger.info(f"Sent webhook batch {batch_num}/{total_batches} ({len(batch)} devices): HTTP {response.status_code}")
 
-    except Exception as err:
+    except Exception as err:  # pylint: disable=broad-exception-caught
         logger.warning(f"Failed to send webhook to config-webapp: {err}")
