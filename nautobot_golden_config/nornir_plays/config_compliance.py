@@ -226,6 +226,12 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
     # Emit in dependency order so the consumer applies prerequisites first.
     compliance_records.sort(key=lambda record: record['apply_order'])
 
+    logger.info(
+        "config-webapp webhook apply_order: "
+        + ", ".join(f"{r['feature_name']}={r['apply_order']}" for r in compliance_records),
+        extra={"object": obj},
+    )
+
     logger.info("Successfully tested compliance job.", extra={"object": obj})
 
     return Result(host=task.host, result=compliance_records)
