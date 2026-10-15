@@ -5,10 +5,10 @@ import difflib
 import json
 import logging
 import os
-import requests
 from collections import defaultdict
 from datetime import datetime
 
+import requests
 from django.utils.timezone import make_aware
 from lxml import etree
 from nautobot_plugin_nornir.constants import NORNIR_SETTINGS
@@ -194,7 +194,7 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
     compliance_obj.compliance_last_success_date = task.host.defaults.data["now"]
     compliance_obj.compliance_config = "\n".join(diff_files(backup_file, intended_file))
     compliance_obj.save()
-    
+
     # Build webhook payload from DB (post-custom-compliance state)
     compliance_records = []
     for comp_record in ConfigCompliance.objects.filter(device=obj):
@@ -206,7 +206,7 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
             'is_compliant': comp_record.compliance,
             'rule_id': str(comp_record.rule.id),
         })
-        
+
     logger.info("Successfully tested compliance job.", extra={"object": obj})
 
     return Result(host=task.host, result=compliance_records)
@@ -338,5 +338,5 @@ def send_compliance_webhook(results, logger):
             else:
                 logger.warning(message)
 
-    except Exception as err:
+    except Exception as err:  # pylint: disable=broad-exception-caught
         logger.warning(f"Failed to send webhook to config-webapp: {err}")
