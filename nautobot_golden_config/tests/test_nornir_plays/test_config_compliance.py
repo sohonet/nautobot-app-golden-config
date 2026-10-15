@@ -5,7 +5,12 @@ import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 from nautobot_golden_config.choices import ComplianceRuleConfigTypeChoice
-from nautobot_golden_config.nornir_plays.config_compliance import get_config_element, get_rules
+from nautobot_golden_config.nornir_plays.config_compliance import (
+    batch_by_size,
+    get_config_element,
+    get_rules,
+    send_compliance_webhook,
+)
 
 
 class ConfigComplianceTest(unittest.TestCase):
@@ -48,3 +53,63 @@ class ConfigComplianceTest(unittest.TestCase):
         mock_rule["obj"].config_type = ComplianceRuleConfigTypeChoice.TYPE_JSON
         return_config = json.dumps(get_config_element(mock_rule, mock_config, mock_obj, None))
         self.assertEqual(return_config, mock_config)
+
+
+def _host_result(name, failed=False, records=None):
+    """Build a fake per-host Nornir MultiResult for one device."""
+    device = Mock(serial="", primary_ip4=None, location=None, device_type=None, role=None, status=None)
+    device.name = name
+    device.platform = Mock(network_driver="arista_eos")
+    result = Mock(result=None if failed else (records or []))
+    result.host.data = {"obj": device}
+    multi_result = MagicMock(failed=failed)
+    multi_result.__getitem__.return_value = result
+    return multi_result
+
+
+@patch.dict("os.environ", {"CONFIG_WEBAPP_WEBHOOK_URL": "https://config-webapp/webhook/"})
+@patch("nautobot_golden_config.nornir_plays.config_compliance.requests.post")
+class SendComplianceWebhookTest(unittest.TestCase):
+    """Test sending compliance results to config-webapp."""
+
+    def test_failed_devices_do_not_block_the_rest(self, mock_post):
+        """Devices that passed are sent; failed ones are skipped and logged."""
+        mock_post.return_value = Mock(ok=True, status_code=202)
+        results = {"sw1": _host_result("sw1"), "sw2": _host_result("sw2", failed=True), "sw3": _host_result("sw3")}
+        logger = Mock()
+
+        send_compliance_webhook(results, logger)
+
+        mock_post.assert_called_once()
+        sent = [device["name"] for device in mock_post.call_args.kwargs["json"]["devices"]]
+        self.assertEqual(sent, ["sw1", "sw3"])
+        self.assertIn("sw2", logger.warning.call_args.args[0])
+
+    def test_non_2xx_response_is_logged_as_warning(self, mock_post):
+        mock_post.return_value = Mock(ok=False, status_code=413)
+        logger = Mock()
+
+        send_compliance_webhook({"sw1": _host_result("sw1")}, logger)
+
+        self.assertIn("HTTP 413", logger.warning.call_args.args[0])
+        logger.info.assert_called_once()  # only the "Sending ..." line
+
+
+class BatchBySizeTest(unittest.TestCase):
+    """Test splitting webhook payloads by size."""
+
+    def test_batches_stay_under_the_cap(self):
+        devices = [{"name": f"sw{i}", "config": "x" * 100} for i in range(10)]
+        device_bytes = len(json.dumps(devices[0]))
+
+        batches = batch_by_size(devices, max_bytes=device_bytes * 3)
+
+        self.assertEqual([len(batch) for batch in batches], [3, 3, 3, 1])
+        self.assertEqual([device for batch in batches for device in batch], devices)
+
+    def test_oversized_device_is_sent_alone(self):
+        devices = [{"name": "small"}, {"name": "big", "config": "x" * 1000}, {"name": "small2"}]
+
+        batches = batch_by_size(devices, max_bytes=100)
+
+        self.assertEqual([[device["name"] for device in batch] for batch in batches], [["small"], ["big"], ["small2"]])
