@@ -1,1 +1,0 @@
-Fixed the config-webapp compliance webhook being skipped for a whole run when any device failed, and batches of 25+ devices being rejected as too large.
