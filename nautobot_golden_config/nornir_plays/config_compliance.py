@@ -2,6 +2,7 @@
 
 # pylint: disable=relative-beyond-top-level
 import difflib
+import json
 import logging
 import os
 import requests
@@ -34,6 +35,9 @@ from nautobot_golden_config.utilities.logger import NornirLogger
 
 InventoryPluginRegister.register("nautobot-inventory", NautobotORMInventory)
 LOGGER = logging.getLogger(__name__)
+
+# Kept well under config-webapp's request size limit for the compliance webhook.
+WEBHOOK_MAX_BATCH_BYTES = 2 * 1024 * 1024
 
 
 def get_rules():
@@ -260,19 +264,50 @@ def config_compliance(job):  # pylint: disable=unused-argument
         if str(err).startswith("`E2") or str(err).startswith("`E1"):
             raise NornirNautobotException(err) from err
     logger.debug("Completed compliance job for devices.")
+    # Send the devices that passed before failing the job, so one failed device
+    # doesn't stop the rest of the run reaching config-webapp.
+    send_compliance_webhook(results, logger)
     if results.failed:
         raise ComplianceFailure()
 
-    # Send webhook with compliance data to config-webapp in batches
+
+def batch_by_size(devices_data, max_bytes=WEBHOOK_MAX_BATCH_BYTES):
+    """Split device payloads into batches whose JSON stays under ``max_bytes``.
+
+    A device larger than ``max_bytes`` on its own is still sent, alone in its batch.
+    """
+    batches, batch, batch_bytes = [], [], 0
+    for device_data in devices_data:
+        size = len(json.dumps(device_data))
+        if batch and batch_bytes + size > max_bytes:
+            batches.append(batch)
+            batch, batch_bytes = [], 0
+        batch.append(device_data)
+        batch_bytes += size
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def send_compliance_webhook(results, logger):
+    """Send compliance results of the devices that passed to config-webapp.
+
+    Failed devices have no compliance records, so they are skipped rather than
+    blocking the rest of the run.
+    """
     try:
         webhook_url = os.environ.get('CONFIG_WEBAPP_WEBHOOK_URL')
         if not webhook_url:
             raise ValueError("CONFIG_WEBAPP_WEBHOOK_URL environment variable is not set")
         logger.info(f"Sending compliance results to config-webapp webhook: {webhook_url}")
         devices_data = []
-        for hostname, task_results in results.items():
+        failed_devices = []
+        for task_results in results.values():
             # task_results[0].host is the actual Host object with data
             device = task_results[0].host.data["obj"]
+            if task_results.failed:
+                failed_devices.append(device.name)
+                continue
             if not device.platform:
                 logger.warning(f"Skipping device {device.name}: no platform assigned")
                 continue
@@ -289,16 +324,19 @@ def config_compliance(job):  # pylint: disable=unused-argument
                 'compliance_records': task_results[0].result
             })
 
-        # Send in batches of 50 devices to avoid large payloads
-        batch_size = 50
-        total_batches = (len(devices_data) + batch_size - 1) // batch_size
+        if failed_devices:
+            logger.warning(
+                f"Not sending {len(failed_devices)} failed device(s) to config-webapp: {', '.join(failed_devices)}"
+            )
 
-        for i in range(0, len(devices_data), batch_size):
-            batch = devices_data[i:i+batch_size]
-            batch_num = (i // batch_size) + 1
-
+        batches = batch_by_size(devices_data)
+        for batch_num, batch in enumerate(batches, start=1):
             response = requests.post(webhook_url, json={'devices': batch}, timeout=10, verify=False)
-            logger.info(f"Sent webhook batch {batch_num}/{total_batches} ({len(batch)} devices): HTTP {response.status_code}")
+            message = f"Sent webhook batch {batch_num}/{len(batches)} ({len(batch)} devices): HTTP {response.status_code}"
+            if response.ok:
+                logger.info(message)
+            else:
+                logger.warning(message)
 
     except Exception as err:
         logger.warning(f"Failed to send webhook to config-webapp: {err}")
