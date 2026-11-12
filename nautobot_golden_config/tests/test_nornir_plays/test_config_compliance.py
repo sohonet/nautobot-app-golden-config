@@ -154,8 +154,6 @@ EOF
 !
 """
 
-CONFIGS = {"aruba_aoscx": AOSCX_CONFIG, "arista_eos": EOS_CONFIG}
-
 
 class SectionConfigTest(unittest.TestCase):
     """section_config must match netutils' and parse each config only once."""
@@ -172,15 +170,34 @@ class SectionConfigTest(unittest.TestCase):
     def setUp(self):
         config_compliance._parse_config.cache_clear()  # pylint: disable=protected-access
 
+    # Output of Sohonet's netutils fork (what production runs) for EOS_CONFIG. Mainline
+    # netutils raises AttributeError on the banner lines, so EOS can't be compared live.
+    EOS_EXPECTED = {
+        ("snmp-server",): "snmp-server community public ro",
+        ("aaa ",): "aaa authentication login default local",
+        ("interface ",): "interface Ethernet1\n   description uplink\n   no shutdown\ninterface Ethernet2\n   shutdown",
+        ("ssh server", "banner"): "banner motd\nwelcome\nEOF",
+        ("no-such-section",): "",
+        (): EOS_CONFIG,
+    }
+
     def test_matches_netutils(self):
-        """Output matches netutils.section_config for every rule shape."""
-        for network_os, config in CONFIGS.items():
-            for rule in self.RULES:
-                with self.subTest(network_os=network_os, rule=rule):
-                    self.assertEqual(
-                        section_config(rule, config, network_os),
-                        netutils_section_config(rule, config, network_os),
-                    )
+        """AOS-CX output matches netutils.section_config for every rule shape."""
+        for rule in self.RULES:
+            with self.subTest(rule=rule):
+                self.assertEqual(
+                    section_config(rule, AOSCX_CONFIG, "aruba_aoscx"),
+                    netutils_section_config(rule, AOSCX_CONFIG, "aruba_aoscx"),
+                )
+
+    def test_eos_matches_production_netutils(self):
+        """EOS output matches what production's netutils fork returns, banner included."""
+        for rule in self.RULES:
+            with self.subTest(rule=rule):
+                self.assertEqual(
+                    section_config(rule, EOS_CONFIG, "arista_eos"),
+                    self.EOS_EXPECTED[tuple(rule["section"])],
+                )
 
     def test_parses_each_config_once(self):
         """Each distinct config is parsed once, however many rules read it."""
