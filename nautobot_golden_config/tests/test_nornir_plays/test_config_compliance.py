@@ -4,12 +4,18 @@ import json
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
+from netutils.config.compliance import section_config as netutils_section_config
+
 from nautobot_golden_config.choices import ComplianceRuleConfigTypeChoice
+from nautobot_golden_config.nornir_plays import config_compliance
 from nautobot_golden_config.nornir_plays.config_compliance import (
     batch_by_size,
     get_config_element,
     get_rules,
+    rules_for_device,
+    section_config,
     send_compliance_webhook,
+    update_compliance,
 )
 
 
@@ -23,9 +29,9 @@ class ConfigComplianceTest(unittest.TestCase):
         mock_obj = Mock(**features)
         mock_obj.name = "test_name"
         mock_obj.platform = Mock(network_driver="test_driver")
-        mock_compliance_rule.objects.all.return_value = [mock_obj]
+        mock_compliance_rule.objects.select_related.return_value = [mock_obj]
         features = get_rules()
-        mock_compliance_rule.objects.all.assert_called_once()
+        mock_compliance_rule.objects.select_related.assert_called_once()
         self.assertEqual(
             features, {"test_driver": [{"obj": mock_obj, "ordered": "test_ordered", "section": ["aaa", "snmp"]}]}
         )
@@ -113,3 +119,156 @@ class BatchBySizeTest(unittest.TestCase):
         batches = batch_by_size(devices, max_bytes=100)
 
         self.assertEqual([[device["name"] for device in batch] for batch in batches], [["small"], ["big"], ["small2"]])
+
+
+AOSCX_CONFIG = """hostname sw1
+!
+snmp-server vrf default
+snmp-server community public
+aaa authentication login default local
+aaa accounting all-mgmt default start-stop
+interface 1/1/1
+    description uplink
+    no shutdown
+interface 1/1/2
+    shutdown
+ssh server vrf mgmt
+banner motd !
+welcome
+!
+"""
+
+
+EOS_CONFIG = """hostname sw2
+!
+snmp-server community public ro
+aaa authentication login default local
+interface Ethernet1
+   description uplink
+   no shutdown
+interface Ethernet2
+   shutdown
+banner motd
+welcome
+EOF
+!
+"""
+
+
+class SectionConfigTest(unittest.TestCase):
+    """section_config must match netutils' and parse each config only once."""
+
+    RULES = (
+        {"section": ["snmp-server"]},
+        {"section": ["aaa "]},
+        {"section": ["interface "]},
+        {"section": ["ssh server", "banner"]},
+        {"section": ["no-such-section"]},
+        {"section": []},
+    )
+
+    def setUp(self):
+        config_compliance._parse_config.cache_clear()  # pylint: disable=protected-access
+
+    # Output of Sohonet's netutils fork (what production runs) for EOS_CONFIG. Mainline
+    # netutils raises AttributeError on the banner lines, so EOS can't be compared live.
+    EOS_EXPECTED = {
+        ("snmp-server",): "snmp-server community public ro",
+        ("aaa ",): "aaa authentication login default local",
+        ("interface ",): "interface Ethernet1\n   description uplink\n   no shutdown\ninterface Ethernet2\n   shutdown",
+        ("ssh server", "banner"): "banner motd\nwelcome\nEOF",
+        ("no-such-section",): "",
+        (): EOS_CONFIG,
+    }
+
+    def test_matches_netutils(self):
+        """AOS-CX output matches netutils.section_config for every rule shape."""
+        for rule in self.RULES:
+            with self.subTest(rule=rule):
+                self.assertEqual(
+                    section_config(rule, AOSCX_CONFIG, "aruba_aoscx"),
+                    netutils_section_config(rule, AOSCX_CONFIG, "aruba_aoscx"),
+                )
+
+    def test_eos_matches_production_netutils(self):
+        """EOS output matches what production's netutils fork returns, banner included."""
+        for rule in self.RULES:
+            with self.subTest(rule=rule):
+                self.assertEqual(
+                    section_config(rule, EOS_CONFIG, "arista_eos"),
+                    self.EOS_EXPECTED[tuple(rule["section"])],
+                )
+
+    def test_parses_each_config_once(self):
+        """Each distinct config is parsed once, however many rules read it."""
+        real_parser = config_compliance.parser_map["aruba_aoscx"]
+        counting_parser = Mock(side_effect=real_parser)
+        with patch.dict(config_compliance.parser_map, {"aruba_aoscx": counting_parser}):
+            for rule in self.RULES:
+                section_config(rule, AOSCX_CONFIG, "aruba_aoscx")
+                section_config(rule, AOSCX_CONFIG + "\n", "aruba_aoscx")
+        self.assertEqual(counting_parser.call_count, 2)
+
+
+class RulesForDeviceTest(unittest.TestCase):
+    """Rules are matched on Platform, not just network_driver."""
+
+    def test_only_this_platforms_rules(self):
+        """Rules of another Platform with the same network_driver are dropped."""
+        eos, eos_rr = Mock(platform_id="eos"), Mock(platform_id="eos-rr")
+        rules = {"arista_eos": [{"obj": eos}, {"obj": eos_rr}]}
+        device = Mock(platform_id="eos")
+        device.platform.network_driver = "arista_eos"
+        self.assertEqual(rules_for_device(rules, device), [{"obj": eos}])
+
+
+class FakeCompliance:  # pylint: disable=too-few-public-methods,too-many-instance-attributes
+    """Stands in for a stored ConfigCompliance row; compliance = actual == intended."""
+
+    def __init__(self, actual, intended):
+        self.device = self.rule = None
+        self.actual, self.intended, self.missing, self.extra = actual, intended, "", ""
+        self.compliance_on_save()
+        self.remediation_on_save()
+
+    def compliance_on_save(self):
+        """Mirror ConfigCompliance.compliance_on_save for the fake row."""
+        self.compliance = self.actual == self.intended
+        self.compliance_int = int(self.compliance)
+        self.ordered = True
+        self.missing = "" if self.compliance else self.intended
+        self.extra = "" if self.compliance else self.actual
+
+    def remediation_on_save(self):
+        """Mirror ConfigCompliance.remediation_on_save for the fake row."""
+        self.remediation = "" if self.compliance else f"fix: {self.intended}"
+
+
+@patch("nautobot_golden_config.nornir_plays.config_compliance.ConfigCompliance")
+class UpdateComplianceTest(unittest.TestCase):
+    """update_compliance only writes when the stored result would change."""
+
+    def test_creates_missing_row(self, mock_cc):
+        """A device/rule with no stored row is created via update_or_create."""
+        mock_cc.objects.filter.return_value.order_by.return_value.__getitem__.return_value = []
+        self.assertTrue(update_compliance("dev", "rule", "a", "a"))
+        mock_cc.objects.update_or_create.assert_called_once_with(
+            device="dev", rule="rule", defaults={"actual": "a", "intended": "a", "missing": "", "extra": ""}
+        )
+
+    def test_skips_unchanged_row(self, mock_cc):
+        """A row that recomputes to exactly what is stored is not saved."""
+        mock_cc.objects.filter.return_value.order_by.return_value.__getitem__.return_value = [FakeCompliance("a", "b")]
+        self.assertFalse(update_compliance("dev", "rule", "a", "b"))
+        mock_cc.objects.update_or_create.assert_not_called()
+
+    def test_saves_changed_row(self, mock_cc):
+        """Any change to the stored result is saved, and the stored row is not mutated."""
+        for actual, intended in (("a", "c"), ("b", "b"), ("x", "b")):
+            with self.subTest(actual=actual, intended=intended):
+                mock_cc.reset_mock()
+                stored = FakeCompliance("a", "b")
+                mock_cc.objects.filter.return_value.order_by.return_value.__getitem__.return_value = [stored]
+                self.assertTrue(update_compliance("dev", "rule", actual, intended))
+                mock_cc.objects.update_or_create.assert_called_once()
+                self.assertEqual((stored.actual, stored.intended), ("a", "b"))  # stored row not mutated

@@ -1,0 +1,1 @@
+Compliance skips saving rows whose result is unchanged (so those rows no longer get an "update" changelog entry or a new last-updated time each run), parses each config once instead of once per rule, and loads related rule data in bulk.

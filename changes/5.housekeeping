@@ -1,0 +1,1 @@
+Pinned the CI test matrix to Nautobot 2.3.7 (the version in production) and made the development image work with Poetry 2.

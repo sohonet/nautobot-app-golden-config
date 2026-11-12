@@ -1,7 +1,9 @@
 """Nornir job for generating the compliance data."""
 
 # pylint: disable=relative-beyond-top-level
+import copy
 import difflib
+import functools
 import json
 import logging
 import os
@@ -13,7 +15,7 @@ from django.utils.timezone import make_aware
 from lxml import etree
 from nautobot_plugin_nornir.constants import NORNIR_SETTINGS
 from nautobot_plugin_nornir.plugins.inventory.nautobot_orm import NautobotORMInventory
-from netutils.config.compliance import _open_file_config, parser_map, section_config
+from netutils.config.compliance import _open_file_config, parser_map
 from nornir import InitNornir
 from nornir.core.plugins.inventory import InventoryPluginRegister
 from nornir.core.task import Result, Task
@@ -44,7 +46,7 @@ def get_rules():
     """A serializer of sorts to return rule mappings as a dictionary."""
     # TODO: Future: Review if creating a proper serializer is the way to go.
     rules = defaultdict(list)
-    for compliance_rule in ComplianceRule.objects.all():
+    for compliance_rule in ComplianceRule.objects.select_related("platform", "feature"):
         platform = str(compliance_rule.platform.network_driver)
         rules[platform].append(
             {
@@ -54,6 +56,111 @@ def get_rules():
             }
         )
     return rules
+
+
+def rules_for_device(rules, obj):
+    """The rules that apply to this device: same network_driver *and* same Platform.
+
+    get_rules() groups by network_driver, and several Platforms can share one
+    (EOS, EOS Route Reflector and EOS VXLAN are all arista_eos). A row created
+    for another Platform's rule is deleted again straight away by the
+    config_compliance_platform_cleanup post_save signal, so evaluating those
+    rules only costs a create, a delete and two changelog entries per rule per
+    device per run. Skipping them leaves the stored result unchanged.
+    """
+    return [rule for rule in rules[obj.platform.network_driver] if rule["obj"].platform_id == obj.platform_id]
+
+
+@functools.lru_cache(maxsize=64)
+def _parse_config(network_os, device_cfg):
+    """Parse a device config once. netutils' section_config re-parses it for every rule.
+
+    The parsed object is only read (its config_lines are iterated), so sharing
+    it between rules and threads is safe. maxsize covers two configs for each of
+    Nornir's worker threads.
+    """
+    return parser_map[network_os](device_cfg)
+
+
+def section_config(feature, device_cfg, network_os):
+    """netutils.config.compliance.section_config, using the cached parse.
+
+    Same logic and output as netutils' version (netutils 1.x); covered by a test
+    that compares the two.
+    """
+    section_starts_with = feature.get("section")
+    if not section_starts_with:
+        return device_cfg
+
+    match = False
+    section_config_list = []
+    for line in _parse_config(network_os, device_cfg).config_lines:
+        # If multiple banners, line after first banner will be None.
+        # This conditional allows multiple banners in config.
+        if not line.config_line:
+            continue
+        if match:
+            if line.parents:  # pylint: disable=no-else-continue
+                section_config_list.append(line.config_line)
+                continue
+            else:
+                match = False
+        for line_start in section_starts_with:
+            if not match and line.config_line.startswith(line_start):
+                section_config_list.append(line.config_line)
+                match = True
+    return "\n".join(section_config_list).strip()
+
+
+# Fields ConfigCompliance.save() stores that depend on the inputs.
+_COMPLIANCE_RESULT_FIELDS = (
+    "actual",
+    "intended",
+    "missing",
+    "extra",
+    "compliance",
+    "compliance_int",
+    "ordered",
+    "remediation",
+)
+
+
+def update_compliance(device, rule, actual, intended):
+    """ConfigCompliance.objects.update_or_create(), minus the save when nothing would change.
+
+    A save re-runs compliance and remediation, full_clean() and the changelog
+    (an ObjectChange serialised through the REST serializer). That was ~45% of
+    the job's CPU, and on most runs most rows come out exactly as stored. So the
+    row is recomputed in memory with the same methods save() calls, and saved
+    only if any stored field would differ. Created and changed rows go through
+    update_or_create() exactly as before. The only difference for an unchanged
+    row is that it is not saved: its last_updated doesn't move, no "update"
+    ObjectChange is written and no post_save signal fires. run_compliance()
+    does the one thing that signal did for this play (removing rows left over
+    from another Platform) itself.
+
+    Returns True if the row was created or saved.
+    """
+    defaults = {"actual": actual, "intended": intended, "missing": "", "extra": ""}
+    # order_by() drops the model's default ordering, which joins device and rule just to sort one row.
+    rows = list(ConfigCompliance.objects.filter(device=device, rule=rule).order_by()[:1])
+    existing = rows[0] if rows else None
+    if existing is not None:
+        candidate = copy.copy(existing)
+        # The caller's device and rule are already loaded (with role, platform,
+        # feature); reuse them rather than lazy-load them per row.
+        candidate.device = device
+        candidate.rule = rule
+        for field, value in defaults.items():
+            setattr(candidate, field, value)
+        # Same methods as ConfigCompliance.save(); custom compliance may rewrite
+        # actual/intended, which is why the comparison is on the stored fields.
+        candidate.compliance_on_save()
+        candidate.remediation_on_save()
+        if all(getattr(candidate, field) == getattr(existing, field) for field in _COMPLIANCE_RESULT_FIELDS):
+            return False
+    ConfigCompliance.objects.update_or_create(device=device, rule=rule, defaults=defaults)
+    return True
 
 
 def get_config_element(rule, config, obj, logger):
@@ -175,21 +282,16 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
     backup_cfg = _open_file_config(backup_file)
     intended_cfg = _open_file_config(intended_file)
 
-    for rule in rules[obj.platform.network_driver]:
+    for rule in rules_for_device(rules, obj):
         _actual = get_config_element(rule, backup_cfg, obj, logger)
         _intended = get_config_element(rule, intended_cfg, obj, logger)
+        update_compliance(obj, rule["obj"], _actual, _intended)
 
-        # using update_or_create() method to conveniently update actual obj or create new one.
-        ConfigCompliance.objects.update_or_create(
-            device=obj,
-            rule=rule["obj"],
-            defaults={
-                "actual": _actual,
-                "intended": _intended,
-                "missing": "",
-                "extra": "",
-            },
-        )
+    # Rows from another Platform's rules (the device changed Platform, or a rule
+    # moved Platform) used to be removed by the config_compliance_platform_cleanup
+    # post_save signal, which fired on every row because every row was saved.
+    # Unchanged rows are no longer saved, so remove them here.
+    ConfigCompliance.objects.filter(device=obj).exclude(rule__platform_id=obj.platform_id).delete()
 
     compliance_obj.compliance_last_success_date = task.host.defaults.data["now"]
     compliance_obj.compliance_config = "\n".join(diff_files(backup_file, intended_file))
@@ -216,7 +318,7 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
         return len(intended_lines)
 
     compliance_records = []
-    for comp_record in ConfigCompliance.objects.filter(device=obj):
+    for comp_record in ConfigCompliance.objects.filter(device=obj).select_related("rule__feature"):
         compliance_records.append({
             'id': str(comp_record.id),
             'feature_name': comp_record.rule.feature.name if comp_record.rule.feature else None,
@@ -292,6 +394,9 @@ def config_compliance(job):  # pylint: disable=unused-argument,too-many-locals
         # re-raise Exception if it's raised from nornir-nautobot or nautobot-app-nornir
         if str(err).startswith("`E2") or str(err).startswith("`E1"):
             raise NornirNautobotException(err) from err
+    finally:
+        # The cache is module-level; don't keep this run's configs in the worker after the job.
+        _parse_config.cache_clear()
     logger.debug("Completed compliance job for devices.")
     # Send the devices that passed before failing the job, so one failed device
     # doesn't stop the rest of the run reaching config-webapp.

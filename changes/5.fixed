@@ -1,0 +1,2 @@
+Compliance no longer creates (and immediately deletes) rows for rules of other platforms that share the same network driver.
+Fixed the job-result links in the Config Plan table, which were missing a closing ">" on their <a> tag.
