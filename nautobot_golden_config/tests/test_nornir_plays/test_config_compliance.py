@@ -250,7 +250,7 @@ class UpdateComplianceTest(unittest.TestCase):
 
     def test_creates_missing_row(self, mock_cc):
         """A device/rule with no stored row is created via update_or_create."""
-        mock_cc.objects.filter.return_value.first.return_value = None
+        mock_cc.objects.filter.return_value.order_by.return_value.__getitem__.return_value = []
         self.assertTrue(update_compliance("dev", "rule", "a", "a"))
         mock_cc.objects.update_or_create.assert_called_once_with(
             device="dev", rule="rule", defaults={"actual": "a", "intended": "a", "missing": "", "extra": ""}
@@ -258,7 +258,7 @@ class UpdateComplianceTest(unittest.TestCase):
 
     def test_skips_unchanged_row(self, mock_cc):
         """A row that recomputes to exactly what is stored is not saved."""
-        mock_cc.objects.filter.return_value.first.return_value = FakeCompliance("a", "b")
+        mock_cc.objects.filter.return_value.order_by.return_value.__getitem__.return_value = [FakeCompliance("a", "b")]
         self.assertFalse(update_compliance("dev", "rule", "a", "b"))
         mock_cc.objects.update_or_create.assert_not_called()
 
@@ -268,7 +268,7 @@ class UpdateComplianceTest(unittest.TestCase):
             with self.subTest(actual=actual, intended=intended):
                 mock_cc.reset_mock()
                 stored = FakeCompliance("a", "b")
-                mock_cc.objects.filter.return_value.first.return_value = stored
+                mock_cc.objects.filter.return_value.order_by.return_value.__getitem__.return_value = [stored]
                 self.assertTrue(update_compliance("dev", "rule", actual, intended))
                 mock_cc.objects.update_or_create.assert_called_once()
                 self.assertEqual((stored.actual, stored.intended), ("a", "b"))  # stored row not mutated

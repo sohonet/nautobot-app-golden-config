@@ -134,12 +134,17 @@ def update_compliance(device, rule, actual, intended):
     row is recomputed in memory with the same methods save() calls, and saved
     only if any stored field would differ. Created and changed rows go through
     update_or_create() exactly as before. The only difference for an unchanged
-    row is that its last_updated no longer moves.
+    row is that it is not saved: its last_updated doesn't move, no "update"
+    ObjectChange is written and no post_save signal fires. run_compliance()
+    does the one thing that signal did for this play (removing rows left over
+    from another Platform) itself.
 
     Returns True if the row was created or saved.
     """
     defaults = {"actual": actual, "intended": intended, "missing": "", "extra": ""}
-    existing = ConfigCompliance.objects.filter(device=device, rule=rule).first()
+    # order_by() drops the model's default ordering, which joins device and rule just to sort one row.
+    rows = list(ConfigCompliance.objects.filter(device=device, rule=rule).order_by()[:1])
+    existing = rows[0] if rows else None
     if existing is not None:
         candidate = copy.copy(existing)
         # The caller's device and rule are already loaded (with role, platform,
@@ -282,6 +287,12 @@ def run_compliance(  # pylint: disable=too-many-arguments,too-many-locals
         _intended = get_config_element(rule, intended_cfg, obj, logger)
         update_compliance(obj, rule["obj"], _actual, _intended)
 
+    # Rows from another Platform's rules (the device changed Platform, or a rule
+    # moved Platform) used to be removed by the config_compliance_platform_cleanup
+    # post_save signal, which fired on every row because every row was saved.
+    # Unchanged rows are no longer saved, so remove them here.
+    ConfigCompliance.objects.filter(device=obj).exclude(rule__platform_id=obj.platform_id).delete()
+
     compliance_obj.compliance_last_success_date = task.host.defaults.data["now"]
     compliance_obj.compliance_config = "\n".join(diff_files(backup_file, intended_file))
     compliance_obj.save()
@@ -383,6 +394,9 @@ def config_compliance(job):  # pylint: disable=unused-argument,too-many-locals
         # re-raise Exception if it's raised from nornir-nautobot or nautobot-app-nornir
         if str(err).startswith("`E2") or str(err).startswith("`E1"):
             raise NornirNautobotException(err) from err
+    finally:
+        # The cache is module-level; don't keep this run's configs in the worker after the job.
+        _parse_config.cache_clear()
     logger.debug("Completed compliance job for devices.")
     # Send the devices that passed before failing the job, so one failed device
     # doesn't stop the rest of the run reaching config-webapp.
