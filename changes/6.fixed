@@ -1,0 +1,2 @@
+Fixed Golden Config jobs that crashed outright reporting SUCCESS when "fail job on task failure" was off; they now fail with the error and traceback in the job log.
+Fixed intended config renders failing at random with "weak object has gone away" when Nornir rendered devices in parallel threads.

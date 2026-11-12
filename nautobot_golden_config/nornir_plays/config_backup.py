@@ -147,9 +147,9 @@ def config_backup(job):
         logger.error(
             f"`E3027:` NornirNautobotException raised during backup tasks. Original exception message: ```{err}```"
         )
-        # re-raise Exception if it's raised from nornir-nautobot or nautobot-app-nornir
-        if str(err).startswith("`E2") or str(err).startswith("`E1"):
-            raise NornirNautobotException(err) from err
+        # Always re-raise: without results there is nothing to report, and carrying on fails with an
+        # UnboundLocalError on `results` that hides this exception.
+        raise
     logger.debug("Completed configuration backup job for devices.")
     if results.failed:
         raise BackupFailure()
