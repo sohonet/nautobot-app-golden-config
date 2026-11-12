@@ -4,9 +4,9 @@ import json
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
-from nautobot_golden_config.choices import ComplianceRuleConfigTypeChoice
 from netutils.config.compliance import section_config as netutils_section_config
 
+from nautobot_golden_config.choices import ComplianceRuleConfigTypeChoice
 from nautobot_golden_config.nornir_plays import config_compliance
 from nautobot_golden_config.nornir_plays.config_compliance import (
     batch_by_size,
