@@ -30,6 +30,9 @@ ENV INVOKE_NAUTOBOT_GOLDEN_CONFIG_LOCAL=true
 RUN which poetry || curl -sSL https://install.python-poetry.org | python3 - && \
     poetry config virtualenvs.create false
 
+# Poetry 2 moved `poetry export` into a plugin; add it when the base image's Poetry lacks it
+RUN poetry export --help >/dev/null 2>&1 || poetry self add poetry-plugin-export
+
 # !!! USE CAUTION WHEN MODIFYING LINES ABOVE
 # -------------------------------------------------------------------------------------
 # App-specifc system build/test dependencies.
