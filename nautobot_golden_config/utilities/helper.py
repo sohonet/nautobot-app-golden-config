@@ -2,6 +2,7 @@
 
 # pylint: disable=raise-missing-from
 import json
+import threading
 from copy import deepcopy
 
 from django.conf import settings
@@ -120,8 +121,28 @@ def get_django_env():
     """
     # Use a custom Jinja2 environment instead of Django's to avoid HTML escaping
     jinja_env = SandboxedEnvironment(**JINJA_ENV)
-    jinja_env.filters = engines["jinja"].env.filters
+    # Copy, so updates to this environment's filters (nornir_jinja2 calls `env.filters.update()` on every render)
+    # never mutate the Django engine's own filter dict.
+    jinja_env.filters = dict(engines["jinja"].env.filters)
     return jinja_env
+
+
+class ThreadLocalJinjaEnv(threading.local):
+    """One Jinja environment per thread, created on first use in that thread.
+
+    Nornir's threaded runner renders many devices at once. `nornir_jinja2.template_file` sets
+    `env.loader = FileSystemLoader(path)` on every call, and Jinja's template cache key holds a weakref to the
+    loader. With one shared environment, one thread replacing the loader can free the loader another thread is
+    looking up, which fails the render with `TypeError: weak object has gone away` (`E1014`). Giving each thread its
+    own environment means only the thread that owns the loader ever replaces it.
+
+    Usage: create one instance per play and read `.env` inside the task.
+    """
+
+    def __init__(self):
+        """Build this thread's environment. `threading.local` calls this once per thread."""
+        super().__init__()
+        self.env = get_django_env()
 
 
 def render_jinja_template(obj, logger, template):
