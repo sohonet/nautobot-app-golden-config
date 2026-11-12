@@ -20,8 +20,8 @@ from nautobot_golden_config.nornir_plays.processor import ProcessGoldenConfig
 from nautobot_golden_config.utilities.db_management import close_threaded_db_connections
 from nautobot_golden_config.utilities.graphql import graph_ql_query
 from nautobot_golden_config.utilities.helper import (
+    ThreadLocalJinjaEnv,
     dispatch_params,
-    get_django_env,
     render_jinja_template,
     verify_settings,
 )
@@ -44,6 +44,8 @@ def run_template(  # pylint: disable=too-many-arguments,too-many-locals
         logger (NornirLogger): Logger to log messages to.
         global_settings (GoldenConfigSetting): The settings for GoldenConfigApp.
         job_class_instance (Result): The the output from the Nautobot Job instance being run.
+        jinja_env (ThreadLocalJinjaEnv | jinja2.Environment): Per-thread Jinja environments for the play. A plain
+            Environment is still accepted but is only safe with a single-threaded runner.
 
     Returns:
         result (Result): Result from Nornir task
@@ -70,6 +72,9 @@ def run_template(  # pylint: disable=too-many-arguments,too-many-locals
         raise NornirNautobotException(error_msg)
 
     task.host.data.update(device_data)
+
+    if isinstance(jinja_env, ThreadLocalJinjaEnv):
+        jinja_env = jinja_env.env
 
     generated_config = task.run(
         task=dispatcher,
@@ -111,8 +116,9 @@ def config_intended(job):
     for settings in set(job.device_to_settings_map.values()):
         verify_settings(logger, settings, ["jinja_path_template", "intended_path_template", "sot_agg_query"])
 
-    # Retrieve filters from the Django jinja template engine
-    jinja_env = get_django_env()
+    # One Jinja environment (with the Django jinja engine's filters) per Nornir worker thread. Sharing one across
+    # threads races on `env.loader`, which nornir_jinja2 replaces on every render (E1014 "weak object has gone away").
+    jinja_env = ThreadLocalJinjaEnv()
     try:
         with InitNornir(
             runner=NORNIR_SETTINGS.get("runner"),

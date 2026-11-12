@@ -4,9 +4,11 @@ from unittest.mock import MagicMock, patch
 
 from nautobot.apps.testing import TransactionTestCase, create_job_result_and_run_job
 from nautobot.dcim.models import Device
+from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices
 from nautobot.extras.models import JobLogEntry
 
 from nautobot_golden_config import jobs
+from nautobot_golden_config.exceptions import IntendedGenerationFailure
 from nautobot_golden_config.tests.conftest import (
     create_device,
     create_orphan_device,
@@ -620,3 +622,94 @@ class GCReposRunAllMultipleTestCase(TransactionTestCase):
 
         log_entries = JobLogEntry.objects.filter(job_result=job_result, grouping="GC Repo Commit and Push")
         self.assertEqual(log_entries.count(), 0)
+
+
+@patch.object(jobs, "ensure_git_repository", MagicMock(return_value=True))
+class GCReposFailureHandlingTestCase(TransactionTestCase):
+    """A crashed play must fail the job and log its traceback; device task failures follow the checkbox."""
+
+    databases = ("default", "job_logs")
+
+    def setUp(self) -> None:
+        """Setup test data."""
+        self.device = create_device(name="foobaz")
+        dgs_gc_settings_and_job_repo_objects()
+        # The test GitRepositories have no remote, so a real push would fail the job on its own.
+        push_patcher = patch.object(jobs, "gc_repo_push")
+        self.mock_push = push_patcher.start()
+        self.addCleanup(push_patcher.stop)
+        super().setUp()
+
+    def _run(self, name, **kwargs):
+        job_result = create_job_result_and_run_job(
+            module="nautobot_golden_config.jobs",
+            name=name,
+            device=Device.objects.filter(name=self.device.name),
+            **kwargs,
+        )
+        job_result.refresh_from_db()
+        return job_result
+
+    def _error_messages(self, job_result):
+        return list(
+            JobLogEntry.objects.filter(job_result=job_result, log_level=LogLevelChoices.LOG_ERROR).values_list(
+                "message", flat=True
+            )
+        )
+
+    @patch("nautobot_golden_config.utilities.constant.ENABLE_COMPLIANCE", True)
+    @patch(
+        "nautobot_golden_config.nornir_plays.config_compliance.get_rules",
+        MagicMock(side_effect=RuntimeError("get_rules exploded")),
+    )
+    def test_play_exception_fails_job_and_logs_traceback(self):
+        """An exception in the play is logged with its traceback and fails the job even with the checkbox off."""
+        job_result = self._run("ComplianceJob", fail_job_on_task_failure=False)
+
+        self.assertEqual(job_result.status, JobResultStatusChoices.STATUS_FAILURE)
+        play_errors = JobLogEntry.objects.filter(job_result=job_result, grouping="GC Play Exception")
+        self.assertEqual(play_errors.count(), 1)
+        message = play_errors.first().message
+        self.assertEqual(play_errors.first().log_level, LogLevelChoices.LOG_ERROR)
+        self.assertIn("`E3001:`", message)
+        self.assertIn("get_rules exploded", message)
+        self.assertIn("Traceback (most recent call last)", message)
+        # Repos are still pushed after a crash.
+        self.mock_push.assert_called_once()
+
+    @patch.object(jobs, "config_intended", MagicMock(side_effect=IntendedGenerationFailure()))
+    def test_device_task_failures_logged_job_succeeds_when_checkbox_off(self):
+        """Device task failures are logged, but only fail the job when fail_job_on_task_failure is set."""
+        job_result = self._run("IntendedJob", fail_job_on_task_failure=False)
+
+        self.assertEqual(job_result.status, JobResultStatusChoices.STATUS_SUCCESS)
+        self.assertTrue(any("`E3030:`" in msg for msg in self._error_messages(job_result)))
+        self.assertFalse(JobLogEntry.objects.filter(job_result=job_result, grouping="GC Play Exception").exists())
+
+    @patch.object(jobs, "config_intended", MagicMock(side_effect=IntendedGenerationFailure()))
+    def test_device_task_failures_fail_job_when_checkbox_on(self):
+        """With fail_job_on_task_failure set, device task failures fail the job."""
+        job_result = self._run("IntendedJob", fail_job_on_task_failure=True)
+
+        self.assertEqual(job_result.status, JobResultStatusChoices.STATUS_FAILURE)
+        self.assertFalse(JobLogEntry.objects.filter(job_result=job_result, grouping="GC Play Exception").exists())
+
+    @patch("nautobot_golden_config.utilities.constant.ENABLE_INTENDED", True)
+    @patch("nautobot_golden_config.utilities.constant.ENABLE_BACKUP", False)
+    @patch("nautobot_golden_config.utilities.constant.ENABLE_COMPLIANCE", False)
+    @patch.object(jobs, "config_intended", MagicMock(side_effect=RuntimeError("intended play exploded")))
+    def test_all_golden_config_play_exception_fails_job(self):
+        """The run-all job also logs a crashed play with its traceback and fails."""
+        job_result = create_job_result_and_run_job(
+            module="nautobot_golden_config.jobs",
+            name="AllGoldenConfig",
+            device=self.device.id,
+            fail_job_on_task_failure=False,
+        )
+        job_result.refresh_from_db()
+
+        self.assertEqual(job_result.status, JobResultStatusChoices.STATUS_FAILURE)
+        message = JobLogEntry.objects.get(job_result=job_result, grouping="GC Play Exception").message
+        self.assertIn("intended play exploded", message)
+        self.assertIn("Traceback (most recent call last)", message)
+        self.mock_push.assert_called_once()
