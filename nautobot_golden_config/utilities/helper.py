@@ -12,6 +12,7 @@ from django.template import engines
 from django.urls import reverse
 from django.utils.html import format_html
 from jinja2 import exceptions as jinja_errors
+from jinja2.environment import create_cache
 from jinja2.sandbox import SandboxedEnvironment
 from lxml import etree
 from nautobot.core.utils.data import render_jinja2
@@ -127,6 +128,9 @@ def get_django_env():
     return jinja_env
 
 
+THREAD_JINJA_CACHE_SIZE = 50
+
+
 class ThreadLocalJinjaEnv(threading.local):
     """One Jinja environment per thread, created on first use in that thread.
 
@@ -143,6 +147,9 @@ class ThreadLocalJinjaEnv(threading.local):
         """Build this thread's environment. `threading.local` calls this once per thread."""
         super().__init__()
         self.env = get_django_env()
+        # nornir_jinja2 installs a new loader per render and the cache is keyed on the loader, so entries are never
+        # reused across devices. Keep enough for includes within one render, not Jinja's default 400 per thread.
+        self.env.cache = create_cache(THREAD_JINJA_CACHE_SIZE)
 
 
 def render_jinja_template(obj, logger, template):
