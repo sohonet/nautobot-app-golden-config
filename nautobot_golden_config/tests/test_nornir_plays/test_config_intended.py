@@ -10,7 +10,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from django.template import engines
-from nornir_jinja2.plugins.tasks import template_file
+
+try:  # Installed in production with the Nornir plugins, but not in this app's dev/CI image.
+    from nornir_jinja2.plugins.tasks import template_file
+except ImportError:  # pragma: no cover
+    template_file = None
 
 from nautobot_golden_config.nornir_plays import config_intended
 from nautobot_golden_config.utilities.helper import ThreadLocalJinjaEnv
@@ -39,6 +43,7 @@ class ThreadLocalJinjaEnvTest(unittest.TestCase):
         self.assertIn("humanize_speed", env.filters)
         self.assertIsNot(env.filters, engines["jinja"].env.filters)
 
+    @unittest.skipIf(template_file is None, "nornir_jinja2 is not installed")
     def test_concurrent_renders_do_not_race_on_loader(self):
         """Regression test for `E1014: Unknown error - weak object has gone away`.
 
