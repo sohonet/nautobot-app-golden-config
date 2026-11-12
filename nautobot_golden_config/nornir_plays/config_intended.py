@@ -149,8 +149,8 @@ def config_intended(job):
         logger.error(
             f"`E3029:` NornirNautobotException raised during intended tasks. Original exception message: ```{err}```"
         )
-        # re-raise Exception if it's raised from nornir-nautobot or nautobot-app-nornir
-        if str(err).startswith("`E2") or str(err).startswith("`E1"):
-            raise NornirNautobotException(err) from err
+        # Always re-raise: without results there is nothing to report, and carrying on fails with an
+        # UnboundLocalError on `results` that hides this exception.
+        raise
     if results.failed:
         raise IntendedGenerationFailure()
