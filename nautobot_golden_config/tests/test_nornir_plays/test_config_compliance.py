@@ -170,9 +170,10 @@ class SectionConfigTest(unittest.TestCase):
     )
 
     def setUp(self):
-        config_compliance._parse_config.cache_clear()
+        config_compliance._parse_config.cache_clear()  # pylint: disable=protected-access
 
     def test_matches_netutils(self):
+        """Output matches netutils.section_config for every rule shape."""
         for network_os, config in CONFIGS.items():
             for rule in self.RULES:
                 with self.subTest(network_os=network_os, rule=rule):
@@ -182,6 +183,7 @@ class SectionConfigTest(unittest.TestCase):
                     )
 
     def test_parses_each_config_once(self):
+        """Each distinct config is parsed once, however many rules read it."""
         real_parser = config_compliance.parser_map["aruba_aoscx"]
         counting_parser = Mock(side_effect=real_parser)
         with patch.dict(config_compliance.parser_map, {"aruba_aoscx": counting_parser}):
@@ -195,6 +197,7 @@ class RulesForDeviceTest(unittest.TestCase):
     """Rules are matched on Platform, not just network_driver."""
 
     def test_only_this_platforms_rules(self):
+        """Rules of another Platform with the same network_driver are dropped."""
         eos, eos_rr = Mock(platform_id="eos"), Mock(platform_id="eos-rr")
         rules = {"arista_eos": [{"obj": eos}, {"obj": eos_rr}]}
         device = Mock(platform_id="eos")
@@ -202,7 +205,7 @@ class RulesForDeviceTest(unittest.TestCase):
         self.assertEqual(rules_for_device(rules, device), [{"obj": eos}])
 
 
-class FakeCompliance:  # pylint: disable=too-few-public-methods
+class FakeCompliance:  # pylint: disable=too-few-public-methods,too-many-instance-attributes
     """Stands in for a stored ConfigCompliance row; compliance = actual == intended."""
 
     def __init__(self, actual, intended):
@@ -212,6 +215,7 @@ class FakeCompliance:  # pylint: disable=too-few-public-methods
         self.remediation_on_save()
 
     def compliance_on_save(self):
+        """Mirror ConfigCompliance.compliance_on_save for the fake row."""
         self.compliance = self.actual == self.intended
         self.compliance_int = int(self.compliance)
         self.ordered = True
@@ -219,6 +223,7 @@ class FakeCompliance:  # pylint: disable=too-few-public-methods
         self.extra = "" if self.compliance else self.actual
 
     def remediation_on_save(self):
+        """Mirror ConfigCompliance.remediation_on_save for the fake row."""
         self.remediation = "" if self.compliance else f"fix: {self.intended}"
 
 
@@ -227,6 +232,7 @@ class UpdateComplianceTest(unittest.TestCase):
     """update_compliance only writes when the stored result would change."""
 
     def test_creates_missing_row(self, mock_cc):
+        """A device/rule with no stored row is created via update_or_create."""
         mock_cc.objects.filter.return_value.first.return_value = None
         self.assertTrue(update_compliance("dev", "rule", "a", "a"))
         mock_cc.objects.update_or_create.assert_called_once_with(
@@ -234,11 +240,13 @@ class UpdateComplianceTest(unittest.TestCase):
         )
 
     def test_skips_unchanged_row(self, mock_cc):
+        """A row that recomputes to exactly what is stored is not saved."""
         mock_cc.objects.filter.return_value.first.return_value = FakeCompliance("a", "b")
         self.assertFalse(update_compliance("dev", "rule", "a", "b"))
         mock_cc.objects.update_or_create.assert_not_called()
 
     def test_saves_changed_row(self, mock_cc):
+        """Any change to the stored result is saved, and the stored row is not mutated."""
         for actual, intended in (("a", "c"), ("b", "b"), ("x", "b")):
             with self.subTest(actual=actual, intended=intended):
                 mock_cc.reset_mock()
