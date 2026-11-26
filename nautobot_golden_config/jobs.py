@@ -4,6 +4,7 @@
 # TODO: Remove the following ignore, added to be able to pass pylint in CI.
 # pylint: disable=arguments-differ
 
+import traceback
 from datetime import datetime
 
 from django.utils.timezone import make_aware
@@ -153,8 +154,35 @@ def gc_repo_push(job, current_repos):
                 repo["repo_obj"].push()
 
 
+DEVICE_TASK_FAILURES = (BackupFailure, IntendedGenerationFailure, ComplianceFailure)
+
+
+def log_play_exception(job, error):
+    """Log an unexpected exception from a Nornir play to the job log, with its traceback.
+
+    Returns:
+        str: The `E3001` error message that was logged.
+    """
+    error_msg = f"`E3001:` General Exception handler, original error message ```{error}```"
+    stack_trace = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    job.logger.error(f"{error_msg}\n```\n{stack_trace}\n```", extra={"grouping": "GC Play Exception"})
+    return error_msg
+
+
 def gc_repos(func):
-    """Decorator used for handle repo syncing, commiting, and pushing."""
+    """Decorator used for handle repo syncing, commiting, and pushing.
+
+    Two kinds of failure are handled differently:
+
+    * Device task failures (`BackupFailure`, `IntendedGenerationFailure`, `ComplianceFailure`): one or more
+      devices failed, and each failure has already been logged per device. The job only ends as FAILURE when the
+      `fail_job_on_task_failure` kwarg is set, which is what that checkbox is for.
+    * Anything else means the play itself crashed (e.g. an exception in `get_rules()`), so no device or only some
+      were processed. That is logged with its traceback and always fails the job, so a broken play can't report
+      SUCCESS.
+
+    Committed work is pushed to the GC repos in both cases.
+    """
 
     def gc_repo_wrapper(self, *args, **kwargs):
         """Decorator used for handle repo syncing, commiting, and pushing."""
@@ -162,11 +190,15 @@ def gc_repos(func):
         # This is where the specific jobs run method runs via this decorator.
         try:
             func(self, *args, **kwargs)
-        except Exception as error:  # pylint: disable=broad-exception-caught
-            error_msg = f"`E3001:` General Exception handler, original error message ```{error}```"
+        except DEVICE_TASK_FAILURES as error:
+            error_msg = f"`E3030:` Failure during {self.Meta.name} Job: one or more device tasks failed."
+            self.logger.error(error_msg)
             # Raise error only if the job kwarg (checkbox) is selected to do so on the job execution form.
             if kwargs.get("fail_job_on_task_failure"):
                 raise NornirNautobotException(error_msg) from error
+        except Exception as error:
+            error_msg = log_play_exception(self, error)
+            raise NornirNautobotException(error_msg) from error
         finally:
             gc_repo_push(job=self, current_repos=current_repos)
 
@@ -307,7 +339,7 @@ class AllGoldenConfig(GoldenConfigJobMixin):
                 self.logger.error("Compliance failure occurred!")
                 failed_jobs.append("Compliance")
             except Exception as error:  # pylint: disable=broad-exception-caught
-                error_msg = f"`E3001:` General Exception handler, original error message ```{error}```"
+                error_msg = log_play_exception(self, error)
         gc_repo_push(job=self, current_repos=current_repos)
         if len(failed_jobs) > 1:
             jobs_list = ", ".join(failed_jobs)
@@ -316,11 +348,12 @@ class AllGoldenConfig(GoldenConfigJobMixin):
         failure_msg = f"`E3030:` Failure during {jobs_list} Job(s)."
         if len(failed_jobs) > 0:
             self.logger.error(failure_msg)
-        if (len(failed_jobs) > 0 or error_msg) and data["fail_job_on_task_failure"]:
-            if not error_msg:
-                error_msg = failure_msg
-            # Raise error only if the job kwarg (checkbox) is selected to do so on the job execution form.
+        if error_msg:
+            # A play crashed (not just device task failures): always fail the job.
             raise NornirNautobotException(error_msg)
+        if len(failed_jobs) > 0 and data["fail_job_on_task_failure"]:
+            # Raise error only if the job kwarg (checkbox) is selected to do so on the job execution form.
+            raise NornirNautobotException(failure_msg)
 
 
 class AllDevicesGoldenConfig(GoldenConfigJobMixin, FormEntry):
@@ -356,7 +389,7 @@ class AllDevicesGoldenConfig(GoldenConfigJobMixin, FormEntry):
                 self.logger.error("Compliance failure occurred!")
                 failed_jobs.append("Compliance")
             except Exception as error:  # pylint: disable=broad-exception-caught
-                error_msg = f"`E3001:` General Exception handler, original error message ```{error}```"
+                error_msg = log_play_exception(self, error)
         gc_repo_push(job=self, current_repos=current_repos)
         if len(failed_jobs) > 1:
             jobs_list = ", ".join(failed_jobs)
@@ -365,11 +398,12 @@ class AllDevicesGoldenConfig(GoldenConfigJobMixin, FormEntry):
         failure_msg = f"`E3030:` Failure during {jobs_list} Job(s)."
         if len(failed_jobs) > 0:
             self.logger.error(failure_msg)
-        if (len(failed_jobs) > 0 or error_msg) and data["fail_job_on_task_failure"]:
-            if not error_msg:
-                error_msg = failure_msg
-            # Raise error only if the job kwarg (checkbox) is selected to do so on the job execution form.
+        if error_msg:
+            # A play crashed (not just device task failures): always fail the job.
             raise NornirNautobotException(error_msg)
+        if len(failed_jobs) > 0 and data["fail_job_on_task_failure"]:
+            # Raise error only if the job kwarg (checkbox) is selected to do so on the job execution form.
+            raise NornirNautobotException(failure_msg)
 
 
 class GenerateConfigPlans(Job, FormEntry):
