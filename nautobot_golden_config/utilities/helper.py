@@ -2,6 +2,7 @@
 
 # pylint: disable=raise-missing-from
 import json
+import threading
 from copy import deepcopy
 
 from django.conf import settings
@@ -11,6 +12,7 @@ from django.template import engines
 from django.urls import reverse
 from django.utils.html import format_html
 from jinja2 import exceptions as jinja_errors
+from jinja2.environment import create_cache
 from jinja2.sandbox import SandboxedEnvironment
 from lxml import etree
 from nautobot.core.utils.data import render_jinja2
@@ -120,8 +122,34 @@ def get_django_env():
     """
     # Use a custom Jinja2 environment instead of Django's to avoid HTML escaping
     jinja_env = SandboxedEnvironment(**JINJA_ENV)
-    jinja_env.filters = engines["jinja"].env.filters
+    # Copy, so updates to this environment's filters (nornir_jinja2 calls `env.filters.update()` on every render)
+    # never mutate the Django engine's own filter dict.
+    jinja_env.filters = dict(engines["jinja"].env.filters)
     return jinja_env
+
+
+THREAD_JINJA_CACHE_SIZE = 50
+
+
+class ThreadLocalJinjaEnv(threading.local):
+    """One Jinja environment per thread, created on first use in that thread.
+
+    Nornir's threaded runner renders many devices at once. `nornir_jinja2.template_file` sets
+    `env.loader = FileSystemLoader(path)` on every call, and Jinja's template cache key holds a weakref to the
+    loader. With one shared environment, one thread replacing the loader can free the loader another thread is
+    looking up, which fails the render with `TypeError: weak object has gone away` (`E1014`). Giving each thread its
+    own environment means only the thread that owns the loader ever replaces it.
+
+    Usage: create one instance per play and read `.env` inside the task.
+    """
+
+    def __init__(self):
+        """Build this thread's environment. `threading.local` calls this once per thread."""
+        super().__init__()
+        self.env = get_django_env()
+        # nornir_jinja2 installs a new loader per render and the cache is keyed on the loader, so entries are never
+        # reused across devices. Keep enough for includes within one render, not Jinja's default 400 per thread.
+        self.env.cache = create_cache(THREAD_JINJA_CACHE_SIZE)
 
 
 def render_jinja_template(obj, logger, template):
